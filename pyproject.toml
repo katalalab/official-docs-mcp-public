@@ -1,0 +1,13 @@
+[project]
+name = "official-docs-mcp"
+version = "0.1.0"
+description = "MCP server for current official AI and developer tool documentation."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+official-docs-mcp = "official_docs_mcp.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

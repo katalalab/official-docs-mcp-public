@@ -1,0 +1,13 @@
+# ローカルの安全チェック。CI の verify と lint も併用する。
+# 有効化: brew install pre-commit && pre-commit install --hook-type pre-commit --hook-type pre-push
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/semgrep/pre-commit
+    rev: c10f2d55ee931fe01984e21c0182aa36e27ff986 # v1.178.0
+    hooks:
+      - id: semgrep
+        args: ["--config", "p/default", "--error", "--skip-unknown-extensions", "--metrics=off"]
+        stages: [pre-push]
