@@ -31,27 +31,42 @@ class SafeFetchError(Exception):
     pass
 
 
-class VerifiedHTTPSConnection(http.client.HTTPSConnection):
-    """Connect to a validated address while retaining the hostname for TLS."""
+def _connect_to_addresses(addresses: list[str], port: int, timeout: float) -> socket.socket:
+    error: OSError | None = None
+    for address in addresses:
+        try:
+            return socket.create_connection((address, port), timeout)
+        except OSError as exc:
+            error = exc
+    assert error is not None  # URL validation guarantees at least one address.
+    raise error
 
-    def __init__(self, host: str, port: int, address: str) -> None:
+
+class VerifiedHTTPSConnection(http.client.HTTPSConnection):
+    """Try validated addresses while retaining the original hostname for TLS."""
+
+    def __init__(self, host: str, port: int, addresses: list[str]) -> None:
         super().__init__(host, port=port, timeout=DEFAULT_TIMEOUT_SECONDS)
-        self._address = address
+        self._addresses = addresses
 
     def connect(self) -> None:
-        sock = socket.create_connection((self._address, self.port), self.timeout)
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        sock = _connect_to_addresses(self._addresses, self.port, self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
 
 
 class VerifiedHTTPConnection(http.client.HTTPConnection):
     """Connect to a configured local service without resolving a second time."""
 
-    def __init__(self, host: str, port: int, address: str) -> None:
+    def __init__(self, host: str, port: int, addresses: list[str]) -> None:
         super().__init__(host, port=port, timeout=DEFAULT_TIMEOUT_SECONDS)
-        self._address = address
+        self._addresses = addresses
 
     def connect(self) -> None:
-        self.sock = socket.create_connection((self._address, self.port), self.timeout)
+        self.sock = _connect_to_addresses(self._addresses, self.port, self.timeout)
 
 
 class HtmlTextExtractor(html.parser.HTMLParser):
@@ -145,32 +160,37 @@ def _parse_url(url: str, *, allow_local_service: bool = False) -> urllib.parse.S
     return parsed
 
 
-def _resolve_address(host: str, port: int, *, require_public: bool) -> str:
+def _resolve_addresses(host: str, port: int, *, require_public: bool) -> list[str]:
     try:
         records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise SafeFetchError from exc
+    addresses = []
     for record in records:
         address = record[4][0]
         try:
-            if not require_public or ipaddress.ip_address(address).is_global:
-                return address
+            if (
+                not require_public or ipaddress.ip_address(address).is_global
+            ) and address not in addresses:
+                addresses.append(address)
         except ValueError:
             continue
-    raise SafeFetchError
+    if not addresses:
+        raise SafeFetchError
+    return addresses
 
 
-def _resolve_public_address(host: str, port: int) -> str:
-    return _resolve_address(host, port, require_public=True)
+def _resolve_public_addresses(host: str, port: int) -> list[str]:
+    return _resolve_addresses(host, port, require_public=True)
 
 
-def _validated_official_url(url: str) -> tuple[urllib.parse.SplitResult, str]:
+def _validated_official_url(url: str) -> tuple[urllib.parse.SplitResult, list[str]]:
     parsed = _parse_url(url)
     host = parsed.hostname
     assert host is not None
     if not _hostname_is_official(host.lower()):
         raise SafeFetchError
-    return parsed, _resolve_public_address(host, parsed.port or 443)
+    return parsed, _resolve_public_addresses(host, parsed.port or 443)
 
 
 def _searxng_validator(base_url: str):
@@ -186,7 +206,7 @@ def _searxng_validator(base_url: str):
         base.port or (443 if base.scheme == "https" else 80),
     )
 
-    def validate(url: str) -> tuple[urllib.parse.SplitResult, str]:
+    def validate(url: str) -> tuple[urllib.parse.SplitResult, list[str]]:
         parsed = _parse_url(url, allow_local_service=True)
         host = parsed.hostname
         assert host is not None
@@ -197,7 +217,7 @@ def _searxng_validator(base_url: str):
         )
         if origin != base_origin:
             raise SafeFetchError
-        return parsed, _resolve_address(
+        return parsed, _resolve_addresses(
             host,
             parsed.port or (443 if parsed.scheme == "https" else 80),
             require_public=False,
@@ -207,17 +227,17 @@ def _searxng_validator(base_url: str):
 
 
 def _request_once(
-    parsed: urllib.parse.SplitResult, address: str, method: str
+    parsed: urllib.parse.SplitResult, addresses: list[str], method: str
 ) -> tuple[int, dict[str, str], bytes]:
     path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
     host = parsed.hostname
     assert host is not None
     if parsed.scheme == "https":
         connection: http.client.HTTPConnection = VerifiedHTTPSConnection(
-            host, parsed.port or 443, address
+            host, parsed.port or 443, addresses
         )
     else:
-        connection = VerifiedHTTPConnection(host, parsed.port or 80, address)
+        connection = VerifiedHTTPConnection(host, parsed.port or 80, addresses)
     try:
         connection.request(
             method,
@@ -241,8 +261,8 @@ def _fetch_url(url: str, method: str, validator: Any) -> dict[str, Any]:
     current_url = url
     try:
         for _ in range(MAX_REDIRECTS + 1):
-            parsed, address = validator(current_url)
-            status, headers, body = _request_once(parsed, address, method)
+            parsed, addresses = validator(current_url)
+            status, headers, body = _request_once(parsed, addresses, method)
             if status not in {301, 302, 303, 307, 308}:
                 return {
                     "ok": 200 <= status < 400,

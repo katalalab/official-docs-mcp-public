@@ -31,6 +31,8 @@ SearXNG未設定時は、各sourceの `llms.txt` / `llms-full.txt` / sitemap / s
 
 公式ドキュメントの取得は HTTPS、登録済み公式ホスト、標準 HTTPS ポートだけを許可します。接続前と各 redirect 後に DNS 解決結果が公開アドレスであることを確認し、その検証済みアドレスへ TLS 接続するため、URL の userinfo、private/loopback 宛て、非公式ホスト、許可条件外への redirect は取得しません。応答本文は 2 MiB で打ち切ります。
 
+接続できないアドレスがある場合は、同じDNS解決で検証した残りのアドレスを順に試します。TLSのホスト名検証は元の公式ホスト名で行い、証明書エラーやリクエスト送信後の失敗では再試行しません。
+
 `OFFICIAL_DOCS_SEARXNG_URL` は明示的に設定した検索サービスだけへの別経路です。ローカル HTTP の SearXNG は利用できますが、redirect は同一 origin に限定します。検索結果から本文を取得する際は、通常の公式 URL 検証を必ず通します。
 
 ## 起動

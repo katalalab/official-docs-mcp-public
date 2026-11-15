@@ -90,7 +90,7 @@ class FetcherTests(unittest.TestCase):
             result = fetch_url("https://platform.openai.com/docs")
 
         self.assertTrue(result["ok"])
-        self.assertEqual(request_once.call_args.args[1], "8.8.8.8")
+        self.assertEqual(request_once.call_args.args[1], ["8.8.8.8"])
 
     def test_fetch_url_rejects_private_dns_address_before_network_access(self) -> None:
         """Removing the public-address check must not allow a private destination."""
@@ -134,7 +134,7 @@ class FetcherTests(unittest.TestCase):
             return_value=LargeResponseConnection(),
         ):
             with self.assertRaises(SafeFetchError):
-                _request_once(urlsplit("https://platform.openai.com/docs"), "8.8.8.8", "GET")
+                _request_once(urlsplit("https://platform.openai.com/docs"), ["8.8.8.8"], "GET")
 
     def test_searxng_redirect_cannot_leave_explicitly_configured_service(self) -> None:
         """Removing the SearXNG origin check must allow an arbitrary redirect target."""
