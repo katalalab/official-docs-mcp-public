@@ -137,10 +137,10 @@ def _safe_error(url: Any, error: str, status: int | None = None) -> dict[str, An
     }
 
 
-def _hostname_is_official(host: str) -> bool:
+def _hostname_is_official(host: str, sources: tuple[DocSource, ...]) -> bool:
     return any(
         host == domain or host.endswith(f".{domain}")
-        for source in SOURCES
+        for source in sources
         for domain in source.official_domains
     )
 
@@ -151,7 +151,7 @@ def _parse_url(url: str, *, allow_local_service: bool = False) -> urllib.parse.S
         port = parsed.port
     except (AttributeError, TypeError, ValueError) as exc:
         raise SafeFetchError from exc
-    if parsed.scheme not in {"https"} and not (allow_local_service and parsed.scheme == "http"):
+    if parsed.scheme != "https" and not (allow_local_service and parsed.scheme == "http"):
         raise SafeFetchError
     if not parsed.hostname or parsed.username is not None or parsed.password is not None:
         raise SafeFetchError
@@ -180,48 +180,35 @@ def _resolve_addresses(host: str, port: int, *, require_public: bool) -> list[st
     return addresses
 
 
-def _resolve_public_addresses(host: str, port: int) -> list[str]:
-    return _resolve_addresses(host, port, require_public=True)
-
-
 def _validated_official_url(url: str) -> tuple[urllib.parse.SplitResult, list[str]]:
     parsed = _parse_url(url)
     host = parsed.hostname
     assert host is not None
-    if not _hostname_is_official(host.lower()):
+    if not _hostname_is_official(host.lower(), SOURCES):
         raise SafeFetchError
-    return parsed, _resolve_public_addresses(host, parsed.port or 443)
+    return parsed, _resolve_addresses(host, parsed.port or 443, require_public=True)
+
+
+def _origin(parsed: urllib.parse.SplitResult) -> tuple[str, str, int]:
+    host = parsed.hostname
+    assert host is not None
+    return parsed.scheme, host.lower(), parsed.port or (443 if parsed.scheme == "https" else 80)
 
 
 def _searxng_validator(base_url: str):
     try:
-        base = _parse_url(base_url, allow_local_service=True)
+        base_origin = _origin(_parse_url(base_url, allow_local_service=True))
     except SafeFetchError:
         return None
-    base_host = base.hostname
-    assert base_host is not None
-    base_origin = (
-        base.scheme,
-        base_host.lower(),
-        base.port or (443 if base.scheme == "https" else 80),
-    )
 
     def validate(url: str) -> tuple[urllib.parse.SplitResult, list[str]]:
         parsed = _parse_url(url, allow_local_service=True)
-        host = parsed.hostname
-        assert host is not None
-        origin = (
-            parsed.scheme,
-            host.lower(),
-            parsed.port or (443 if parsed.scheme == "https" else 80),
-        )
+        origin = _origin(parsed)
         if origin != base_origin:
             raise SafeFetchError
-        return parsed, _resolve_addresses(
-            host,
-            parsed.port or (443 if parsed.scheme == "https" else 80),
-            require_public=False,
-        )
+        _, _, port = origin
+        assert parsed.hostname is not None
+        return parsed, _resolve_addresses(parsed.hostname, port, require_public=False)
 
     return validate
 
@@ -299,15 +286,8 @@ def is_official_url(url: str, source: DocSource | None = None) -> bool:
         parsed = _parse_url(url)
     except SafeFetchError:
         return False
-    host = parsed.hostname
-    if not host:
-        return False
-    sources = (source,) if source else SOURCES
-    return any(
-        host.lower() == domain or host.lower().endswith(f".{domain}")
-        for item in sources
-        for domain in item.official_domains
-    )
+    assert parsed.hostname is not None  # _parse_url rejects URLs without a host.
+    return _hostname_is_official(parsed.hostname.lower(), (source,) if source else SOURCES)
 
 
 def source_for_url(url: str) -> DocSource | None:
@@ -319,16 +299,17 @@ def source_for_url(url: str) -> DocSource | None:
 
 def response_to_document(url: str, fetched: dict[str, Any]) -> dict[str, Any]:
     body = fetched.get("body", b"")
-    content_type = fetched.get("headers", {}).get("content-type", "")
+    headers = fetched.get("headers", {})
+    content_type = headers.get("content-type", "")
+    final_url = fetched.get("url") or url
     text = body.decode("utf-8", errors="replace")
     links: list[dict[str, str]] = []
     if "html" in content_type or "<html" in text[:1000].lower():
         parser = HtmlTextExtractor()
         parser.feed(text)
-        base_url = fetched.get("url") or url
         text = parser.text()
         links = [
-            {"url": urllib.parse.urljoin(base_url, href), "text": label}
+            {"url": urllib.parse.urljoin(final_url, href), "text": label}
             for href, label in parser.links
             if href and not href.startswith(("#", "mailto:", "javascript:"))
         ]
@@ -337,19 +318,19 @@ def response_to_document(url: str, fetched: dict[str, Any]) -> dict[str, Any]:
     else:
         text = normalize_text(text)
     digest = hashlib.sha256(body).hexdigest() if body else None
-    source = source_for_url(fetched.get("url") or url)
+    source = source_for_url(final_url)
     return {
-        "url": fetched.get("url") or url,
+        "url": final_url,
         "requested_url": url,
         "status": fetched.get("status"),
         "ok": fetched.get("ok"),
         "source_id": source.id if source else None,
         "source_name": source.name if source else None,
-        "official": is_official_url(fetched.get("url") or url, source),
+        "official": is_official_url(final_url, source),
         "retrieved_at": fetched.get("retrieved_at"),
         "content_type": content_type,
-        "etag": fetched.get("headers", {}).get("etag"),
-        "last_modified": fetched.get("headers", {}).get("last-modified"),
+        "etag": headers.get("etag"),
+        "last_modified": headers.get("last-modified"),
         "sha256": digest,
         "text": text[:120_000],
         "links": links[:200],
@@ -394,21 +375,25 @@ def freshness(url: str) -> dict[str, Any]:
 
 def collect_candidate_urls(source: DocSource, limit: int = 80) -> list[str]:
     urls: list[str] = []
+
+    def add(url: str) -> bool:
+        """Append a new URL; return True once the limit is reached."""
+        if url in urls:
+            return False
+        urls.append(url)
+        return len(urls) >= limit
+
     for url in (*source.llms_full_urls, *source.llms_urls, *source.sitemap_urls, *source.seed_urls):
-        if url not in urls:
-            urls.append(url)
-            if len(urls) >= limit:
-                return urls[:limit]
+        if add(url):
+            return urls[:limit]
     for llms_url in (*source.llms_urls, *source.llms_full_urls):
         fetched = fetch_url(llms_url)
         if not fetched.get("ok"):
             continue
         text = fetched["body"].decode("utf-8", errors="replace")
         for match in re.findall(r"https?://[^\s)\]>\"']+", text):
-            if is_official_url(match, source) and match not in urls:
-                urls.append(match)
-                if len(urls) >= limit:
-                    return urls[:limit]
+            if is_official_url(match, source) and add(match):
+                return urls[:limit]
     for sitemap_url in source.sitemap_urls:
         fetched = fetch_url(sitemap_url)
         if not fetched.get("ok"):
@@ -420,10 +405,8 @@ def collect_candidate_urls(source: DocSource, limit: int = 80) -> list[str]:
         for loc in root.iter():
             if loc.tag.endswith("loc") and loc.text:
                 candidate = loc.text.strip()
-                if is_official_url(candidate, source) and candidate not in urls:
-                    urls.append(candidate)
-                    if len(urls) >= limit:
-                        return urls[:limit]
+                if is_official_url(candidate, source) and add(candidate):
+                    return urls[:limit]
     return urls[:limit]
 
 
@@ -470,8 +453,7 @@ def direct_search(query: str, source: DocSource | None, limit: int) -> list[dict
     results: list[dict[str, Any]] = []
     for item in sources:
         for url in collect_candidate_urls(item, limit=max(60, limit * 12)):
-            url_score = sum(1 for term in terms if term in url.lower())
-            score = url_score
+            score = sum(1 for term in terms if term in url.lower())
             snippet = f"Official candidate from {item.name}. Fetch for exact content and citation."
             title = url.rstrip("/").rsplit("/", 1)[-1] or item.name
             if score == 0 and terms and len(results) < limit:
@@ -531,16 +513,20 @@ def snippet_for_terms(text: str, terms: list[str], width: int = 320) -> str:
     return normalize_space(text[start:end])
 
 
+def _unknown_source(source_id: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": f"Unknown source_id: {source_id}",
+        "sources": [item.id for item in SOURCES],
+    }
+
+
 def search_official_docs(
     query: str, source_id: str | None = None, limit: int = 8
 ) -> dict[str, Any]:
     source = get_source(source_id)
     if source_id and not source:
-        return {
-            "ok": False,
-            "error": f"Unknown source_id: {source_id}",
-            "sources": [item.id for item in SOURCES],
-        }
+        return _unknown_source(source_id)
     results = searxng_search(query, source, limit)
     backend = "searxng"
     if not results:
@@ -568,11 +554,7 @@ def collect_official_docs(
 ) -> dict[str, Any]:
     source = get_source(source_id)
     if source_id and not source:
-        return {
-            "ok": False,
-            "error": f"Unknown source_id: {source_id}",
-            "sources": [item.id for item in SOURCES],
-        }
+        return _unknown_source(source_id)
     sources = (source,) if source else SOURCES
     limit_per_source = max(1, min(int(limit_per_source), 250))
     catalog_sources: list[dict[str, Any]] = []
