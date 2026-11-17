@@ -205,6 +205,36 @@ class FetcherTests(unittest.TestCase):
         self.assertEqual(candidates[0], "https://modelcontextprotocol.io/llms-full.txt")
         self.assertEqual(len(candidates), 2)
 
+    def test_discovered_urls_are_official_deduplicated_and_limited(self) -> None:
+        source = get_source("cursor")
+        assert source is not None
+        configured = len(
+            {*source.llms_full_urls, *source.llms_urls, *source.sitemap_urls, *source.seed_urls}
+        )
+        llms = b"https://docs.cursor.com/a https://evil.example/x https://docs.cursor.com/a"
+        sitemap = (
+            b"<urlset><url><loc> https://docs.cursor.com/b </loc></url>"
+            b"<url><loc>https://docs.cursor.com/c</loc></url></urlset>"
+        )
+
+        def fake_fetch(url: str, method: str = "GET") -> dict:
+            if url.endswith("llms.txt"):
+                return {"ok": True, "body": llms}
+            if url.endswith("sitemap.xml"):
+                return {"ok": True, "body": sitemap}
+            return {"ok": False}
+
+        with patch("official_docs_mcp.fetcher.fetch_url", side_effect=fake_fetch):
+            everything = collect_candidate_urls(source, limit=configured + 10)
+            limited = collect_candidate_urls(source, limit=configured + 2)
+        discovered = [
+            "https://docs.cursor.com/a",
+            "https://docs.cursor.com/b",
+            "https://docs.cursor.com/c",
+        ]
+        self.assertEqual(everything[configured:], discovered)
+        self.assertEqual(limited, everything[: configured + 2])
+
 
 if __name__ == "__main__":
     unittest.main()
